@@ -19,7 +19,7 @@ Content-Type: application/json
 **Body (JSON):**
 ```json
 {
-  "endpointUrl": "opc.tcp://192.168.2.139:49320",
+  "endpointUrl": "",
   "useSecurity": false,
   "username": null,
   "password": null
