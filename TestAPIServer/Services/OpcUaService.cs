@@ -1,10 +1,11 @@
 using Opc.Ua;
 using Opc.Ua.Client;
+using System.Collections.Concurrent;
+using System.Data;
+using System.Text;
+using System.Threading.Channels;
 using TestAPIServer.Models;
 using ClientSession = Opc.Ua.Client.Session;
-using System.Collections.Concurrent;
-using System.Threading.Channels;
-using System.Data;
 
 namespace TestAPIServer.Services;
 
@@ -29,106 +30,170 @@ public class OpcUaService : IOpcUaService, IDisposable
     [Obsolete]
     public async Task<bool> ConnectAsync(OpcUaConnectionRequest request)
     {
-        var endpointUrl = string.IsNullOrWhiteSpace(request.EndpointUrl)
-            ? _configuration["OpcUa:DefaultEndpointUrl"] : request.EndpointUrl;
-
-        var useSecurity = string.IsNullOrWhiteSpace(request.EndpointUrl)
-            ? _configuration.GetValue<bool>("OpcUa:UseSecurity", false)
-            : request.UseSecurity;
-        
         try
         {
-            if (_session != null && _session.Connected)
-            {
-                _logger.LogInformation("이미 연결된 세션이 있습니다. 기존 연결을 재사용합니다.");
+            // 1. 이미 연결된 세션이 있다면 재사용
+            if (IsSessionReusable())
                 return true;
-            }
-            
+
             CleanupSession();
 
-            _logger.LogInformation("OPC UA 서버 연결 시도: {EndpointUrl}", endpointUrl);
+            var endpointUrl = ResolveEndpointUrl(request);
+            var useSecurity = ResolveSecurityOption(request);
 
-            _applicationConfiguration = new ApplicationConfiguration
-            {
-                ApplicationName = "TestAPIServer",
-                ApplicationUri = Utils.Format(@"urn:{0}:TestAPIServer", System.Net.Dns.GetHostName()),
-                ApplicationType = ApplicationType.Client,
-                SecurityConfiguration = new SecurityConfiguration
-                {
-                    ApplicationCertificate = new CertificateIdentifier { StoreType = @"Directory", StorePath = @"%CommonApplicationData%\OPC Foundation\CertificateStores\MachineDefault", SubjectName = "TestAPIServer" },
-                    TrustedIssuerCertificates = new CertificateTrustList { StoreType = @"Directory", StorePath = @"%CommonApplicationData%\OPC Foundation\CertificateStores\UA Certificate Authorities" },
-                    TrustedPeerCertificates = new CertificateTrustList { StoreType = @"Directory", StorePath = @"%CommonApplicationData%\OPC Foundation\CertificateStores\UA Applications" },
-                    RejectedCertificateStore = new CertificateTrustList { StoreType = @"Directory", StorePath = @"%CommonApplicationData%\OPC Foundation\CertificateStores\RejectedCertificates" },
-                    AutoAcceptUntrustedCertificates = true
-                },
-                TransportConfigurations = new TransportConfigurationCollection(),
-                ClientConfiguration = new ClientConfiguration { DefaultSessionTimeout = 60000 }
-            };
+            // 2. App 설정 구성
+            _applicationConfiguration = await BuildAppConfiguration();
 
-            await _applicationConfiguration.ValidateAsync(ApplicationType.Client);
+            // 3. 사용자 인증 정보 생성
+            var userIdentity = CreateUserIdentity(request);
 
-            var userIdentityTokens = new UserTokenPolicyCollection();
-            userIdentityTokens.Add(new UserTokenPolicy { TokenType = UserTokenType.Anonymous, PolicyId = "Anonymous" });
-            
-            if (!string.IsNullOrEmpty(request.Username))
-            {
-                userIdentityTokens.Add(new UserTokenPolicy { TokenType = UserTokenType.UserName, PolicyId = "Username" });
-            }
+            // 4. Endpoint 설정 구성
+            var endpointDescription = BuildEndpointDescription(endpointUrl, useSecurity, request);
 
-            var endpointDescription = new EndpointDescription
-            {
-                EndpointUrl = endpointUrl,
-                SecurityMode = useSecurity ? MessageSecurityMode.SignAndEncrypt : MessageSecurityMode.None,
-                SecurityPolicyUri = useSecurity ? SecurityPolicies.Basic256Sha256 : SecurityPolicies.None,
-                Server = new ApplicationDescription { ApplicationUri = endpointUrl, ApplicationName = "KEPServer" },
-                UserIdentityTokens = userIdentityTokens
-            };
+            // 5. 구성 Endpoint 생성
+            var configuredEndpoint = CreateConfiguredEndpoint(endpointDescription);
 
-            var endpointConfig = EndpointConfiguration.Create(_applicationConfiguration);
-            endpointConfig.OperationTimeout = 15000;
-            var configuredEndpoint = new ConfiguredEndpoint(null, endpointDescription, endpointConfig);
-
-            IUserIdentity? userIdentity = null;
-            if (!string.IsNullOrEmpty(request.Username))
-            {
-                var passwordBytes = string.IsNullOrEmpty(request.Password) 
-                    ? Array.Empty<byte>() 
-                    : System.Text.Encoding.UTF8.GetBytes(request.Password);
-                userIdentity = new UserIdentity(request.Username, passwordBytes);
-            }
-
-            _session = await ClientSession.Create(
-                _applicationConfiguration,
-                configuredEndpoint,
-                false,
-                "TestAPIServer",
-                60000,
-                userIdentity,
-                null);
+            // 6. 세션 생성
+            _session = await CreateSession(configuredEndpoint, userIdentity);
 
             if (_session != null && _session.Connected)
             {
-                _session.KeepAlive += (session, e) =>
-                {
-                    if (e.CurrentState != ServerState.Running)
-                    {
-                        _logger.LogWarning("OPC UA 서버 연결이 끊어졌습니다. 상태: {State}", e.CurrentState);
-                        CleanupSubscriptions();
-                    }
-                };
-
+                SetupKeepAlive(_session);
                 _logger.LogInformation("OPC UA 서버에 연결되었습니다: {EndpointUrl}", endpointUrl);
                 return true;
             }
 
-            _logger.LogError("세션이 생성되었지만 연결되지 않았습니다: {EndpointUrl}", endpointUrl);
             return false;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "OPC UA 연결 중 오류 발생: {Message}", ex.Message);
+            _logger.LogError(ex, ex.Message);
             return false;
         }
+    }
+
+    private string ResolveEndpointUrl(OpcUaConnectionRequest request)
+    {
+        return string.IsNullOrWhiteSpace(request.EndpointUrl)
+            ? _configuration["OpcUa:DefaultEndpointUrl"] ?? string.Empty
+            : request.EndpointUrl;
+    }
+
+    private bool ResolveSecurityOption(OpcUaConnectionRequest request)
+    {
+        return string.IsNullOrWhiteSpace(request.EndpointUrl)
+            ? _configuration.GetValue<bool>("OpcUa:UseSecurity", false)
+            : request.UseSecurity;
+    }
+
+    private bool IsSessionReusable()
+    {
+        if (_session != null && _session.Connected)
+        {
+            _logger.LogInformation("이미 연결된 세션을 재사용합니다.");
+            return true;
+        }
+        return false;
+    }
+
+    private async Task<ApplicationConfiguration> BuildAppConfiguration()
+    {
+        var config = new ApplicationConfiguration
+        {
+            ApplicationName = "TestAPIServer",
+            ApplicationUri = Utils.Format(@"urn:{0}:TestAPIServer", System.Net.Dns.GetHostName()),
+            ApplicationType = ApplicationType.Client,
+
+            SecurityConfiguration = new SecurityConfiguration
+            {
+                ApplicationCertificate = new CertificateIdentifier
+                {
+                    StoreType = @"Directory",
+                    StorePath = @"%CommonApplicationData%\OPC Foundation\CertificateStores\MachineDefault",
+                    SubjectName = "TestAPIServer"
+                },
+                TrustedIssuerCertificates = new CertificateTrustList { StoreType = @"Directory", StorePath = @"%CommonApplicationData%\OPC Foundation\CertificateStores\UA Certificate Authorities" },
+                TrustedPeerCertificates = new CertificateTrustList { StoreType = @"Directory", StorePath = @"%CommonApplicationData%\OPC Foundation\CertificateStores\UA Applications" },
+                RejectedCertificateStore = new CertificateTrustList { StoreType = @"Directory", StorePath = @"%CommonApplicationData%\OPC Foundation\CertificateStores\RejectedCertificates" },
+                AutoAcceptUntrustedCertificates = true
+            },
+
+            TransportConfigurations = new TransportConfigurationCollection(),
+            ClientConfiguration = new ClientConfiguration { DefaultSessionTimeout = 60000 }
+        };
+
+        await config.ValidateAsync(ApplicationType.Client);
+
+        return config;
+    }
+
+    private IUserIdentity? CreateUserIdentity(OpcUaConnectionRequest request)
+    {
+        if (string.IsNullOrEmpty(request.Username))
+            return null;
+
+        var passwordBytes = string.IsNullOrEmpty(request.Password)
+            ? Array.Empty<byte>()
+            : Encoding.UTF8.GetBytes(request.Password);
+
+        return new UserIdentity(request.Username, passwordBytes);
+    }
+
+    private EndpointDescription BuildEndpointDescription(
+    string endpointUrl,
+    bool useSecurity,
+    OpcUaConnectionRequest request)
+    {
+        var tokenPolicies = new UserTokenPolicyCollection
+    {
+        new UserTokenPolicy { TokenType = UserTokenType.Anonymous, PolicyId = "Anonymous" }
+    };
+
+        if (!string.IsNullOrEmpty(request.Username))
+        {
+            tokenPolicies.Add(new UserTokenPolicy { TokenType = UserTokenType.UserName, PolicyId = "Username" });
+        }
+
+        return new EndpointDescription
+        {
+            EndpointUrl = endpointUrl,
+            SecurityMode = useSecurity ? MessageSecurityMode.SignAndEncrypt : MessageSecurityMode.None,
+            SecurityPolicyUri = useSecurity ? SecurityPolicies.Basic256Sha256 : SecurityPolicies.None,
+            Server = new ApplicationDescription { ApplicationUri = endpointUrl, ApplicationName = "KEPServer" },
+            UserIdentityTokens = tokenPolicies
+        };
+    }
+
+    private ConfiguredEndpoint CreateConfiguredEndpoint(EndpointDescription desc)
+    {
+        var endpointConfig = EndpointConfiguration.Create(_applicationConfiguration);
+        endpointConfig.OperationTimeout = 15000;
+
+        return new ConfiguredEndpoint(null, desc, endpointConfig);
+    }
+
+    [Obsolete]
+    private async Task<ClientSession?> CreateSession(ConfiguredEndpoint endpoint, IUserIdentity? identity)
+    {
+        return await ClientSession.Create(
+            _applicationConfiguration,
+            endpoint,
+            false,
+            "TestAPIServer",
+            60000,
+            identity,
+            null);
+    }
+    private void SetupKeepAlive(ClientSession session)
+    {
+        session.KeepAlive += (s, e) =>
+        {
+            if (e.CurrentState != ServerState.Running)
+            {
+                _logger.LogWarning("OPC UA 서버 연결이 끊어졌습니다. 상태: {State}", e.CurrentState);
+                CleanupSubscriptions();
+            }
+        };
     }
 
     public async Task DisconnectAsync()
